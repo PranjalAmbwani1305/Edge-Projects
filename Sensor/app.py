@@ -41,7 +41,53 @@ st.markdown("""
     </style>
 """, unsafe_allow_html=True)
 
-# --- 2. Logic: Generation ---
+# --- 2. Helper: Data Cleaning (CRITICAL FIX) ---
+def clean_dataframe(df):
+    """
+    Standardizes column names to prevent KeyError.
+    """
+    # 1. Clean Headers
+    df.columns = df.columns.str.strip().str.title()
+    
+    # 2. Rename Map (Handles variations)
+    rename_map = {
+        'Time': 'Timestamp', 'Date': 'Timestamp', 
+        'Sensor': 'Sensor_Name', 'Node': 'Sensor_Name',
+        'Voltage': 'Voltage_V', 'Volts': 'Voltage_V', 
+        'Adc': 'ADC_Value', 'Adc_Value': 'ADC_Value', 'Adc Value': 'ADC_Value'
+    }
+    df.rename(columns=rename_map, inplace=True)
+    
+    # 3. Drop Duplicate Columns
+    df = df.loc[:, ~df.columns.duplicated()]
+    
+    # 4. Ensure Required Columns Exist
+    if 'Timestamp' in df.columns:
+        df['Timestamp'] = pd.to_datetime(df['Timestamp']).dt.round('1s')
+    
+    if 'Sensor_Name' in df.columns:
+        df['Sensor_Name'] = df['Sensor_Name'].apply(normalize_sensor_names)
+        
+    # 5. Fix Numeric Types (Prevent crash if missing)
+    if 'Voltage_V' not in df.columns: df['Voltage_V'] = 0.0
+    if 'ADC_Value' not in df.columns: df['ADC_Value'] = 0
+    
+    df['Voltage_V'] = pd.to_numeric(df['Voltage_V'], errors='coerce').fillna(0.0)
+    df['ADC_Value'] = pd.to_numeric(df['ADC_Value'], errors='coerce').fillna(0).astype(int)
+    
+    if 'Status' not in df.columns:
+        df['Status'] = 'New'
+        
+    return df
+
+def normalize_sensor_names(name):
+    n = str(name).strip().lower()
+    if 'temp' in n or 'node_1' in n: return 'Temperature'
+    if 'moist' in n or 'node_2' in n: return 'Moisture'
+    if 'light' in n or 'node_3' in n: return 'Light'
+    return n.title()
+
+# --- 3. Logic: Generation ---
 def generate_sensor_data(sensor_name, interval_seconds, v_min, v_max, duration_hours, start_time):
     total_seconds = duration_hours * 3600
     timestamps = [start_time + timedelta(seconds=i) for i in range(0, total_seconds, interval_seconds)]
@@ -72,73 +118,40 @@ def generate_full_dataset(start_date_obj):
     full_df = full_df.sort_values(by="Timestamp").reset_index(drop=True)
     return full_df
 
-# --- 3. Logic: Merge (Strict User Logic) ---
-def normalize_sensor_names(name):
-    n = str(name).strip().lower()
-    if 'temp' in n or 'node_1' in n: return 'Temperature'
-    if 'moist' in n or 'node_2' in n: return 'Moisture'
-    if 'light' in n or 'node_3' in n: return 'Light'
-    return n.title()
-
+# --- 4. Logic: Merge ---
 def merge_logic_exact(master_df, new_df):
-    """
-    Implements your exact logic.
-    """
-    # Fix for your CSV: Rename columns so the logic below works
-    new_df.columns = new_df.columns.str.strip().str.title()
-    rename_map = {
-        'Time': 'Timestamp', 'Date': 'Timestamp', 
-        'Sensor': 'Sensor_Name', 'Node': 'Sensor_Name',
-        'Voltage': 'Voltage_V', 'Volts': 'Voltage_V', 
-        'Adc': 'ADC_Value', 'Adc_Value': 'ADC_Value'
-    }
-    new_df.rename(columns=rename_map, inplace=True)
-    new_df = new_df.loc[:, ~new_df.columns.duplicated()]
-
-    # Format
-    new_df['Timestamp'] = pd.to_datetime(new_df['Timestamp']).dt.round('1s')
-    new_df['Sensor_Name'] = new_df['Sensor_Name'].apply(normalize_sensor_names)
+    # 1. Clean Incoming Data
+    new_df = clean_dataframe(new_df)
     
-    # Fill missing values to prevent crashes
-    if 'Voltage_V' not in new_df.columns: new_df['Voltage_V'] = 0.0
-    if 'ADC_Value' not in new_df.columns: new_df['ADC_Value'] = 0
-    new_df['Voltage_V'] = pd.to_numeric(new_df['Voltage_V'], errors='coerce').fillna(0.0)
-    new_df['ADC_Value'] = pd.to_numeric(new_df['ADC_Value'], errors='coerce').fillna(0).astype(int)
-    new_df['Status'] = 'New'
-
-    # Mark Overlaps (Visual Aid)
+    # 2. Mark Overlaps
     if not master_df.empty:
-        master_df['Timestamp'] = pd.to_datetime(master_df['Timestamp']).dt.round('1s')
+        # Ensure Master is clean too
+        master_df = clean_dataframe(master_df) 
         master_df['Status'] = 'Historical'
+        
         m_idx = master_df.set_index(['Timestamp', 'Sensor_Name']).index
         n_idx = new_df.set_index(['Timestamp', 'Sensor_Name']).index
         master_df.loc[m_idx.isin(n_idx), 'Status'] = 'Overlap'
 
-    # --- YOUR LOGIC STARTS HERE ---
+    # 3. Core Merge Logic
+    combined = pd.concat([master_df, new_df])
     
-    # 3. Merge Strategy
-    combined_df = pd.concat([master_df, new_df])
+    # "keep='first' to preserve Master data"
+    final_df = combined.drop_duplicates(subset=['Timestamp', 'Sensor_Name'], keep='first')
+    final_df = final_df.sort_values(by='Timestamp').reset_index(drop=True)
     
-    # 4. Remove Duplicates
-    # keep='first' means: If the Master already has a record for this Time+Sensor,
-    # keep the Master's version and ignore the new file's version.
-    combined_df = combined_df.drop_duplicates(subset=['Timestamp', 'Sensor_Name'], keep='first')
-    
-    # 5. Sort
-    combined_df = combined_df.sort_values(by='Timestamp').reset_index(drop=True)
-    
-    # Calculate Stats
+    # Stats
     stats = {
         "old": len(master_df),
         "new_file": len(new_df),
-        "final": len(combined_df),
-        "added": len(combined_df) - len(master_df)
+        "final": len(final_df),
+        "added": len(final_df) - len(master_df)
     }
     stats["ignored"] = stats["new_file"] - stats["added"]
     
-    return combined_df, stats
+    return final_df, stats
 
-# --- 4. Logic: Compression (Task 1) ---
+# --- 5. Logic: Compression ---
 def analyze_compression(df):
     results = []
     total_raw_bytes = 0
@@ -186,7 +199,7 @@ def analyze_compression(df):
     
     return pd.DataFrame(results), summary
 
-# --- 5. Logic: Error Detection (Task 2) ---
+# --- 6. Logic: Error Detection ---
 def check_system_health(df):
     alerts = []
     for sensor, sub in df.groupby('Sensor_Name'):
@@ -224,15 +237,18 @@ def check_system_health(df):
             })
     return pd.DataFrame(alerts)
 
-# --- 6. Logic: Accuracy & Analytics ---
+# --- 7. Logic: Analytics ---
 def get_analytics(df):
-    if df.empty or 'Voltage_V' not in df.columns: return {}
+    # CRITICAL: Re-verify columns here just in case
+    if df.empty or 'ADC_Value' not in df.columns: 
+        # Attempt to clean one last time if missing
+        df = clean_dataframe(df.copy())
+        if 'ADC_Value' not in df.columns: return {}
+
     results = {}
     
     for sensor, sub_raw in df.groupby('Sensor_Name'):
         sub = sub_raw.copy()
-        sub['Voltage_V'] = pd.to_numeric(sub['Voltage_V'], errors='coerce').fillna(0.0)
-        sub['ADC_Value'] = pd.to_numeric(sub['ADC_Value'], errors='coerce').fillna(0)
         
         if len(sub) > 0:
             exp = (sub['Voltage_V'] / V_REF * ADC_MAX).astype(int)
@@ -241,11 +257,10 @@ def get_analytics(df):
             hw = 0.0
         results[sensor] = {'count': len(sub), 'hw': hw, 'ai': 0.0}
     
-    clean = df.dropna(subset=['Voltage_V', 'Sensor_Name']).copy()
-    clean['Voltage_V'] = pd.to_numeric(clean['Voltage_V'], errors='coerce').fillna(0)
-    
-    if clean['Sensor_Name'].nunique() >= 2:
+    # AI Accuracy
+    if df['Sensor_Name'].nunique() >= 2:
         try:
+            clean = df.dropna(subset=['Voltage_V', 'Sensor_Name'])
             X = clean[['Voltage_V']]
             y = clean['Sensor_Name']
             X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.3, random_state=42)
@@ -263,15 +278,14 @@ def get_analytics(df):
         
     return results
 
-# --- 7. Main App ---
+# --- 8. Main App ---
 
+# Initial Load Logic: Clean data immediately on load
 if 'master_df' not in st.session_state:
     if os.path.exists(MASTER_CSV):
         try:
-            st.session_state.master_df = pd.read_csv(MASTER_CSV)
-            st.session_state.master_df['Timestamp'] = pd.to_datetime(st.session_state.master_df['Timestamp'])
-            st.session_state.master_df['Voltage_V'] = pd.to_numeric(st.session_state.master_df['Voltage_V'], errors='coerce').fillna(0.0)
-            st.session_state.master_df['ADC_Value'] = pd.to_numeric(st.session_state.master_df['ADC_Value'], errors='coerce').fillna(0).astype(int)
+            raw_df = pd.read_csv(MASTER_CSV)
+            st.session_state.master_df = clean_dataframe(raw_df)
         except:
             st.session_state.master_df = pd.DataFrame(columns=['Timestamp', 'Sensor_Name', 'Voltage_V', 'ADC_Value'])
     else:
@@ -284,7 +298,6 @@ with st.sidebar:
     st.title("Control Panel")
     st.markdown("---")
     
-    # --- UPDATED SECTION: INITIALIZE OR UPLOAD ---
     st.subheader("1. Initialize Master Data")
     
     # Option A: Upload Master
@@ -293,21 +306,17 @@ with st.sidebar:
         if st.button("Load Master from File"):
             try:
                 loaded_df = pd.read_csv(master_upload)
+                # CLEAN IMMEDIATELY
+                loaded_df = clean_dataframe(loaded_df)
                 
-                # --- FIX: Clean headers here to avoid "Invalid CSV" error ---
-                loaded_df.columns = loaded_df.columns.str.strip().str.title()
-                rename_map = {'Time': 'Timestamp', 'Date': 'Timestamp', 'Sensor': 'Sensor_Name', 'Node': 'Sensor_Name', 'Voltage': 'Voltage_V', 'Adc': 'ADC_Value'}
-                loaded_df.rename(columns=rename_map, inplace=True)
-                
-                # Ensure basic columns exist
-                if 'Timestamp' in loaded_df.columns and 'Sensor_Name' in loaded_df.columns:
+                if not loaded_df.empty and 'Timestamp' in loaded_df.columns:
                     loaded_df.to_csv(MASTER_CSV, index=False)
                     st.session_state.master_df = loaded_df
                     st.success("Master File Loaded Successfully!")
                     time.sleep(1)
                     st.rerun()
                 else:
-                    st.error("Invalid CSV: Must contain 'Timestamp' and 'Sensor_Name'")
+                    st.error("Invalid CSV structure.")
             except Exception as e:
                 st.error(f"Error loading file: {e}")
 
@@ -317,6 +326,8 @@ with st.sidebar:
         with st.spinner("Generating..."):
             start_date = datetime.now().date()
             new_data = generate_full_dataset(start_date)
+            # Ensure generated data is clean (it should be, but good practice)
+            new_data = clean_dataframe(new_data)
             new_data.to_csv(MASTER_CSV, index=False)
             st.session_state.master_df = new_data
             time.sleep(0.5)
@@ -328,18 +339,20 @@ with st.sidebar:
     
     if uploaded:
         if st.button("Run Merge Script"):
-            new_raw = pd.read_csv(uploaded)
-            final_df, stats = merge_logic_exact(master_df, new_raw)
-            
-            final_df.to_csv(MASTER_CSV, index=False)
-            st.session_state.master_df = final_df
-            
-            # Show Success & Stats cleanly
-            msg = f"Merge Complete! Added: {stats['added']} | Ignored: {stats['ignored']}"
-            st.toast(msg, icon="✅")
-            st.success(msg)
-            time.sleep(1)
-            st.rerun()
+            try:
+                new_raw = pd.read_csv(uploaded)
+                final_df, stats = merge_logic_exact(master_df, new_raw)
+                
+                final_df.to_csv(MASTER_CSV, index=False)
+                st.session_state.master_df = final_df
+                
+                msg = f"Merge Complete! Added: {stats['added']} | Ignored: {stats['ignored']}"
+                st.toast(msg, icon="✅")
+                st.success(msg)
+                time.sleep(1)
+                st.rerun()
+            except Exception as e:
+                st.error(f"Merge Failed: {e}")
 
     st.markdown("---")
     if st.button("Factory Reset"):
@@ -351,6 +364,11 @@ with st.sidebar:
 st.title("SensorEdge")
 
 if not master_df.empty:
+    # Ensure master_df is clean before using
+    if 'ADC_Value' not in master_df.columns:
+        master_df = clean_dataframe(master_df)
+        st.session_state.master_df = master_df
+
     k1, k2, k3, k4 = st.columns(4)
     analytics = get_analytics(master_df)
     
@@ -364,7 +382,6 @@ if not master_df.empty:
     
     st.divider()
     
-    # FINAL TABS
     tab1, tab2, tab3, tab4 = st.tabs(["Rows Value/Counts", "Data Inspector", "System Requirements", "Compression Lab"])
     
     with tab1:
@@ -402,7 +419,6 @@ if not master_df.empty:
             c1, c2 = st.columns(2)
             c1.error(f"{len(health_df)} Issues Detected")
             c2.warning("Action Required: Check sensor calibration.")
-            
             st.dataframe(health_df, use_container_width=True, hide_index=True)
         else:
             st.success("All Systems Nominal.")
