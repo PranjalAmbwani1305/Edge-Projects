@@ -80,39 +80,33 @@ def normalize_sensor_names(name):
     if 'light' in n or 'node_3' in n: return 'Light'
     return n.title()
 
-def clean_incoming_data(df):
-    """Standardizes column names and formats for any uploaded file."""
-    df.columns = df.columns.str.strip().str.title()
+def merge_logic_exact(master_df, new_df):
+    """
+    Implements your exact logic.
+    """
+    # Fix for your CSV: Rename columns so the logic below works
+    new_df.columns = new_df.columns.str.strip().str.title()
     rename_map = {
         'Time': 'Timestamp', 'Date': 'Timestamp', 
         'Sensor': 'Sensor_Name', 'Node': 'Sensor_Name',
         'Voltage': 'Voltage_V', 'Volts': 'Voltage_V', 
         'Adc': 'ADC_Value', 'Adc_Value': 'ADC_Value'
     }
-    df.rename(columns=rename_map, inplace=True)
-    df = df.loc[:, ~df.columns.duplicated()]
-    return df
-
-def merge_logic_exact(master_df, new_df):
-    """
-    Implements the exact logic from your script:
-    Concat -> Drop Duplicates (keep='first') -> Sort
-    """
-    # 1. Clean Incoming Data
-    new_df = clean_incoming_data(new_df)
+    new_df.rename(columns=rename_map, inplace=True)
+    new_df = new_df.loc[:, ~new_df.columns.duplicated()]
 
     # Format
     new_df['Timestamp'] = pd.to_datetime(new_df['Timestamp']).dt.round('1s')
     new_df['Sensor_Name'] = new_df['Sensor_Name'].apply(normalize_sensor_names)
     
-    # Validation/Fill
+    # Fill missing values to prevent crashes
     if 'Voltage_V' not in new_df.columns: new_df['Voltage_V'] = 0.0
     if 'ADC_Value' not in new_df.columns: new_df['ADC_Value'] = 0
     new_df['Voltage_V'] = pd.to_numeric(new_df['Voltage_V'], errors='coerce').fillna(0.0)
     new_df['ADC_Value'] = pd.to_numeric(new_df['ADC_Value'], errors='coerce').fillna(0).astype(int)
     new_df['Status'] = 'New'
 
-    # 2. Logic: Mark Overlaps (Visual Aid Only)
+    # Mark Overlaps (Visual Aid)
     if not master_df.empty:
         master_df['Timestamp'] = pd.to_datetime(master_df['Timestamp']).dt.round('1s')
         master_df['Status'] = 'Historical'
@@ -120,25 +114,29 @@ def merge_logic_exact(master_df, new_df):
         n_idx = new_df.set_index(['Timestamp', 'Sensor_Name']).index
         master_df.loc[m_idx.isin(n_idx), 'Status'] = 'Overlap'
 
-    # 3. CORE LOGIC (User Provided)
-    combined = pd.concat([master_df, new_df])
+    # --- YOUR LOGIC STARTS HERE ---
     
-    # "keep='first' means: If the Master already has a record for this Time+Sensor,
-    # keep the Master's version and ignore the new file's version."
-    final_df = combined.drop_duplicates(subset=['Timestamp', 'Sensor_Name'], keep='first')
+    # 3. Merge Strategy
+    combined_df = pd.concat([master_df, new_df])
     
-    final_df = final_df.sort_values(by='Timestamp').reset_index(drop=True)
+    # 4. Remove Duplicates
+    # keep='first' means: If the Master already has a record for this Time+Sensor,
+    # keep the Master's version and ignore the new file's version.
+    combined_df = combined_df.drop_duplicates(subset=['Timestamp', 'Sensor_Name'], keep='first')
     
-    # Calculate Stats for Notification
+    # 5. Sort
+    combined_df = combined_df.sort_values(by='Timestamp').reset_index(drop=True)
+    
+    # Calculate Stats
     stats = {
         "old": len(master_df),
         "new_file": len(new_df),
-        "final": len(final_df),
-        "added": len(final_df) - len(master_df)
+        "final": len(combined_df),
+        "added": len(combined_df) - len(master_df)
     }
     stats["ignored"] = stats["new_file"] - stats["added"]
     
-    return final_df, stats
+    return combined_df, stats
 
 # --- 4. Logic: Compression (Task 1) ---
 def analyze_compression(df):
@@ -231,7 +229,6 @@ def get_analytics(df):
     if df.empty or 'Voltage_V' not in df.columns: return {}
     results = {}
     
-    # Hardware Fidelity
     for sensor, sub_raw in df.groupby('Sensor_Name'):
         sub = sub_raw.copy()
         sub['Voltage_V'] = pd.to_numeric(sub['Voltage_V'], errors='coerce').fillna(0.0)
@@ -244,7 +241,6 @@ def get_analytics(df):
             hw = 0.0
         results[sensor] = {'count': len(sub), 'hw': hw, 'ai': 0.0}
     
-    # AI Accuracy (Random Forest)
     clean = df.dropna(subset=['Voltage_V', 'Sensor_Name']).copy()
     clean['Voltage_V'] = pd.to_numeric(clean['Voltage_V'], errors='coerce').fillna(0)
     
@@ -298,8 +294,10 @@ with st.sidebar:
             try:
                 loaded_df = pd.read_csv(master_upload)
                 
-                # --- FIX: CLEAN COLUMNS HERE ---
-                loaded_df = clean_incoming_data(loaded_df)
+                # --- FIX: Clean headers here to avoid "Invalid CSV" error ---
+                loaded_df.columns = loaded_df.columns.str.strip().str.title()
+                rename_map = {'Time': 'Timestamp', 'Date': 'Timestamp', 'Sensor': 'Sensor_Name', 'Node': 'Sensor_Name', 'Voltage': 'Voltage_V', 'Adc': 'ADC_Value'}
+                loaded_df.rename(columns=rename_map, inplace=True)
                 
                 # Ensure basic columns exist
                 if 'Timestamp' in loaded_df.columns and 'Sensor_Name' in loaded_df.columns:
@@ -336,7 +334,7 @@ with st.sidebar:
             final_df.to_csv(MASTER_CSV, index=False)
             st.session_state.master_df = final_df
             
-            # Show Success & Stats cleanly (No raw log)
+            # Show Success & Stats cleanly
             msg = f"Merge Complete! Added: {stats['added']} | Ignored: {stats['ignored']}"
             st.toast(msg, icon="✅")
             st.success(msg)
